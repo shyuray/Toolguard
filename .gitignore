@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+# never commit raw runs or model responses
+out/
+runs/
+*_raw.jsonl
+llm_raw.jsonl

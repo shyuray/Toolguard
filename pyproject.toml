@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "toolguard"
+version = "0.1.0"
+description = "A provenance-aware, LLM-guided guard for AI agent tool calls."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Ray Hsu" }]
+keywords = ["llm", "agent", "security", "prompt-injection", "guardrail", "tool-calls"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: Security",
+]
+dependencies = []
+
+[project.optional-dependencies]
+gemini = ["google-genai>=1.0"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+toolguard = "toolguard.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/shyuray/Toolguard"
+
+[tool.setuptools]
+packages = ["toolguard"]
