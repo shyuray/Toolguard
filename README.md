@@ -11,9 +11,26 @@ data to an attacker.
 The core idea: separate **who asked** (provenance) from **what it does** (harm).
 Deterministic checks answer provenance precisely — a recipient that first appears
 in a *tool output* was not authorized by the user. An LLM, grounded in that
-deterministic evidence, weighs the rest. A single hard rule (the
-injected-destination signature) is a safety floor that can override the LLM, so
-the clearest attack pattern is a guarantee, not a hope.
+deterministic evidence, weighs the rest. A tiered hard floor catches
+high-confidence attack patterns as a guarantee, not a hope.
+
+## What's new in v0.2
+
+- **Entity extraction & normalized matching**: emails and URLs are extracted by
+  regex and compared by exact equality, not substring. `xa@b.example` no longer
+  falsely matches `a@b.example`.
+- **Negation detection**: if the user says "Do NOT send to attacker@evil.example",
+  that destination is marked `user_forbidden` and hard-blocked.
+- **Auto-sink detection**: tools not listed in `write_tools` but whose arguments
+  look like destinations (emails, URLs, sink parameter names) are automatically
+  detected and guarded.
+- **Tiered hard floor**: `user_forbidden` → hard block; tool-sourced +
+  external domain + no plan → hard block; tool-sourced + internal domain + no
+  plan → **confirm** (guided, not static).
+- **Source-to-sink taint tracking**: destinations flowing from untrusted tool
+  outputs to external sinks are flagged.
+- **LLM prompt sandboxing**: XML boundary tags with anti-injection directives
+  protect the judge from adversarial text in tool outputs.
 
 ## Install
 
@@ -69,70 +86,63 @@ python examples/live_demo.py             # monitor vs intercept on one attack ca
 ## The three decisions
 
 - **allow** — the user authorized this destination/action and it isn't harmful.
-- **block** — the destination came from a tool output (not the user), or the
-  action is clearly malicious.
-- **confirm** — the user authorized it but it's potentially harmful, or rules
-  alone can't decide (e.g. a delete has no destination to trace). Escalate to a
-  human instead of silently allowing or blocking.
+- **block** — the destination came from a tool output (not the user), was
+  explicitly prohibited by the user, or the action is clearly malicious.
+- **confirm** — the user authorized it but it's potentially harmful, provenance
+  is ambiguous, or rules alone can't decide. Escalate to a human instead of
+  silently allowing or blocking.
 
 ## How it decides
 
 ```
-first write call
+first sink call found (write_tools ∪ sink_tools ∪ auto-detected)
       │
       ▼
-build Evidence  ── deterministic: recipient sources, plan membership,
-      │              destructive?, external domain?
+build Evidence  ── entity extraction (regex, normalized equality)
+      │              negation detection (bounded window, sentence-scoped)
+      │              recipient sources, plan membership,
+      │              destructive?, external domain?, taint?
+      │
       ▼
-hard floor?  ── destination only in tool output AND tool not in plan
-      │  yes → BLOCK (overrides the LLM)
-      │  no
+hard floor?
+      │  user_forbidden → BLOCK
+      │  tool-sourced + not_in_plan → BLOCK
+      │  tool-sourced + no plan + external → BLOCK
+      │  tool-sourced + no plan + internal → pass through (CONFIRM later)
+      │
       ▼
 LLM provider set? ── yes → guided decision (two-axis prompt + Evidence)
       │              no  → rules-only mapping (allow / block / confirm)
 ```
 
-Only write calls are judged; reads always pass. The judging unit is the trace's
-first write call.
+Only sink calls are judged; reads always pass.
 
 ## Configuration
 
-`GuardConfig` is where you describe your agent (see `default_workspace_config()`
-for an AgentDojo-style example):
-
-- `write_tools` — the tools that change state; only these are judged.
-- `dest_params` — tool → the parameter holding destinations (`send_email` →
-  `recipients`). Tools not listed have no destination to trace.
-- `destructive_tools` — irreversible tools (delete/overwrite), flagged in evidence.
-- `plans` — task id → the tools its reference plan legitimately uses.
-- `org_domains` — internal email domains; a destination outside them is flagged
-  external (leave empty to disable).
-
-## Evaluating on your own runs
-
-The guard reads the AgentDojo logging shape (messages under `injections`), so you
-can replay saved runs offline. `ReplayProvider` lets you feed pre-recorded model
-responses instead of live calls, to evaluate an LLM guard without spending quota:
+`GuardConfig` is where you describe your agent:
 
 ```python
-from toolguard.llm import ReplayProvider
-guard = Guard(cfg, provider=ReplayProvider(saved_responses, key_fn=my_key))
+GuardConfig(
+    write_tools={"send_email", "delete_file"},          # tools that modify state
+    dest_params={"send_email": "recipients"},            # which param holds destinations
+    destructive_tools={"delete_file"},                   # irreversible actions
+    plans={"task_0": {"send_email"}},                    # reference plans (optional)
+    org_domains={"acme.example"},                        # internal domains (optional)
+    untrusted_source_tools={"read_email", "search_web"}, # tools reading external data
+    sink_tools=set(),                                    # additional sinks beyond write_tools
+    negation_keywords={"don't", "never", "不要", "禁止"},  # negative intent tokens
+    auto_detect_sinks=True,                              # heuristic sink detection
+    sink_param_patterns={"url", "recipient", "endpoint"}, # param name patterns
+)
 ```
 
-## Limitations
+See `default_workspace_config()` for a ready-made profile.
 
-- String matching is a proxy for real provenance/taint tracking; an attacker who
-  launders a value through paraphrase can defeat it.
-- Reference plans rarely exist at deployment time; they are the weakest input.
-- The LLM guard shares the failure modes of the model behind it, including being
-  swayed by content it reads. The hard floor is deliberately narrow so it does
-  not depend on the model being right.
-- Single judging unit (first write call) — a trace with several writes needs the
-  guard invoked per call, which `wrap()` does.
+## Design & evaluation
 
-See `docs/DESIGN.md` for the evaluation that motivated this architecture.
+See [docs/DESIGN.md](docs/DESIGN.md) for the rationale, evaluation findings,
+and architecture decisions.
 
 ## License
 
-MIT. This project ships only fictional example data; it contains no personal or
-account information.
+MIT

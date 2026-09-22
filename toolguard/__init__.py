@@ -19,7 +19,7 @@ from .config import GuardConfig, default_workspace_config
 from .guard import Guard
 from .types import Decision, Evidence, GuardResult, Message, ToolCall
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
     "Guard", "GuardConfig", "default_workspace_config",
     "Decision", "Evidence", "GuardResult", "Message", "ToolCall",

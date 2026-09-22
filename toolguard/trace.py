@@ -8,9 +8,14 @@ Also accepts a plain list of message dicts for other agents.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Optional
 
+from .config import GuardConfig
 from .types import Message, ToolCall
+
+_EMAIL_RE = re.compile(r'[\w.+\-]+@[\w.\-]+\.\w+')
+_URL_RE = re.compile(r'https?://[^\s<>"\')\]]+', re.IGNORECASE)
 
 
 def _text(msg: dict) -> str:
@@ -60,6 +65,50 @@ def first_write_call(messages: list[Message], write_tools: set[str]
             for tc in m.tool_calls:
                 if tc.function in write_tools:
                     return i, tc
+    return None
+
+
+def _arg_looks_like_sink(param_name: str, param_value: Any,
+                         patterns: set[str]) -> bool:
+    """Heuristic: does this arg name or value look like a sink destination?"""
+    name_lower = param_name.lower()
+    if any(pat in name_lower for pat in patterns):
+        return True
+    if isinstance(param_value, str):
+        v = param_value.strip()
+        if _EMAIL_RE.fullmatch(v) or _URL_RE.match(v):
+            return True
+    if isinstance(param_value, list):
+        for item in param_value:
+            if isinstance(item, str):
+                v = item.strip()
+                if _EMAIL_RE.fullmatch(v) or _URL_RE.match(v):
+                    return True
+    return False
+
+
+def first_sink_call(messages: list[Message], cfg: GuardConfig
+                    ) -> Optional[tuple[int, ToolCall]]:
+    """Find the first tool call that qualifies as a sink.
+
+    A call is a sink if:
+    1. Its function is in write_tools or sink_tools, OR
+    2. auto_detect_sinks is on AND any of its arguments look like a
+       destination (name matches sink_param_patterns, or value is email/URL).
+
+    This replaces first_write_call as the primary selection function in v0.2.
+    """
+    explicit = cfg.all_sink_tools
+    for i, m in enumerate(messages):
+        if m.role == "assistant":
+            for tc in m.tool_calls:
+                if tc.function in explicit:
+                    return i, tc
+                if cfg.auto_detect_sinks and tc.args:
+                    for pname, pval in tc.args.items():
+                        if _arg_looks_like_sink(pname, pval,
+                                               cfg.sink_param_patterns):
+                            return i, tc
     return None
 
 

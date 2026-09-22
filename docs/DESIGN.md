@@ -40,24 +40,73 @@ between the two sets is who asked — all three engines discriminated perfectly.
 Provenance is a learnable, checkable signal; the mess is only where provenance
 and harm disagree.
 
-## The resulting architecture
+## The resulting architecture (v0.2)
 
-- Rules produce **evidence**, not verdicts.
-- One **hard floor** — destination only in tool output *and* tool not in plan —
-  forces a block and overrides the LLM. It is deliberately narrow so it does not
-  rely on the model being right; it makes the clearest attack pattern a
-  guarantee.
-- The **LLM decides** everything else, grounded in the evidence, reasoning along
-  the two axes explicitly and emitting `allow` / `block` / `confirm`.
-- **confirm** exists for the honest case the earlier setup collapsed: the user
-  authorized something genuinely risky. Escalate to a human rather than silently
-  allowing or blocking.
-- Without an LLM provider the guard degrades to a transparent rules-only mapping,
-  escalating anything unresolved to `confirm`.
+### Evidence, not verdicts
+
+Rules produce **evidence** — structured facts about each destination's origin,
+entity type, and negation context — rather than final verdicts. The LLM or
+rules-only fallback consumes this evidence to make the decision.
+
+### Entity extraction and negation detection
+
+v0.2 replaces the fragile substring matching of v0.1 with:
+
+- **Regex-based entity extraction**: emails and URLs are identified by pattern
+  and compared by normalized equality, not `in`. This prevents `xa@b.example`
+  from falsely matching `a@b.example`.
+- **Negation-aware polarity**: when a destination entity appears in a user
+  message, the guard checks a bounded window (60 characters before the entity,
+  stopping at sentence boundaries) for negation keywords. If "don't", "never",
+  "禁止", etc. are found, the destination is marked `user_forbidden` rather than
+  `user` — meaning the user *prohibited* this destination.
+
+### Tiered hard floor
+
+The hard floor forces a **BLOCK** that overrides the LLM, but is deliberately
+kept narrow to avoid over-blocking:
+
+| Condition | Decision | Rationale |
+|---|---|---|
+| Any destination is `user_forbidden` | **BLOCK** | User explicitly said "don't send to X" |
+| Destination from tool output + plan exists + tool not in plan | **BLOCK** | Classic injected-destination signature (v0.1 behavior) |
+| Destination from tool output + no plan + external domain | **BLOCK** | High-confidence: external target + tool-sourced + no plan |
+| Destination from tool output + no plan + internal/unknown domain | **CONFIRM** | Could be legitimate ("reply to whoever emailed me"); escalate, don't hard-block |
+
+This preserves the **guided-not-static** philosophy: the hard floor catches
+high-confidence attacks, while ambiguous cases go to the LLM or human review
+rather than being silently blocked.
+
+### Auto-sink parameter detection
+
+v0.2 introduces heuristic detection of sink parameters for tools not explicitly
+listed in `write_tools` or `dest_params`. If a tool's arguments contain
+parameter names matching common sink patterns (`url`, `endpoint`, `recipient`,
+etc.) or values that look like emails or URLs, the guard treats the call as a
+sink and applies provenance checks. This catches novel exfiltration tools
+(e.g. `post_data(url=...)`) without requiring configuration changes.
+
+Auto-detection only applies to unknown tools — tools already in `write_tools`
+but not in `dest_params` are intentionally configured without destination
+tracking (e.g. `delete_file`).
+
+### LLM prompt sandboxing
+
+The LLM judge prompt uses XML boundary tags (`<untrusted_history>`) with
+explicit anti-injection directives, telling the model to treat tool output
+contents as raw data, not instructions. This reduces the risk of the judge
+itself being manipulated by adversarial text in the agent's execution trace.
+
+### The `confirm` path
+
+`confirm` exists for the honest case that earlier setups collapsed: the user
+authorized something genuinely risky, or provenance is ambiguous. Escalate to a
+human rather than silently allowing or blocking. The `Guard.wrap()` API takes an
+`on_confirm` callback that gives the integrator control over the UX.
 
 ## What this does not measure
 
-Constructed must-block samples, a single task family, string matching as a proxy
-for taint tracking, reference plans that won't exist at deployment, and a single
-model. The guard is a starting point for measurement and layering, not a solved
-defense.
+Constructed must-block samples, a limited set of task families, regex matching as
+a proxy for taint tracking, reference plans that won't exist at deployment, and a
+single model. Negation detection uses keyword heuristics, not full NLU. The guard
+is a starting point for measurement and layering, not a solved defense.

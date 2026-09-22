@@ -1,12 +1,14 @@
 """The Guard: combine deterministic evidence, a hard-floor backstop, and an
 optional guided LLM into one allow/block/confirm decision per write call.
 
-Design (v3, guided-not-static):
+Design (v3/v0.2, guided-not-static):
 - Rules never gate on their own; they produce Evidence.
-- One hard floor (the injected-destination signature) can force BLOCK.
+- Hard floor forces BLOCK for:
+    * user_forbidden destinations (user explicitly said "don't")
+    * tool-sourced + not_in_plan (plan exists)
+    * tool-sourced + external + no plan (high-confidence injection)
 - With an LLM provider: the LLM decides, grounded in the Evidence. The floor
-  still overrides an LLM 'allow', so the injected-destination pattern is a
-  guarantee, not a hope.
+  still overrides an LLM 'allow'.
 - Without a provider (rules-only mode): a transparent mapping from the Evidence
   to allow/block/confirm, with anything unresolved escalated to confirm rather
   than silently allowed.
@@ -18,8 +20,8 @@ from typing import Callable, Optional
 from .config import GuardConfig, default_workspace_config
 from .llm import Provider, build_prompt, parse_response, ParseError
 from .rules import build_evidence, hard_floor
-from .trace import (first_write_call, render_history, render_tool_call,
-                    user_request)
+from .trace import (first_sink_call, first_write_call, render_history,
+                    render_tool_call, user_request)
 from .types import Decision, Evidence, GuardResult, Message, ToolCall
 
 
@@ -38,7 +40,8 @@ class Guard:
     def decide(self, messages: list[Message], task: str,
                pending: Optional[tuple[int, ToolCall]] = None) -> GuardResult:
         if pending is None:
-            pending = first_write_call(messages, self.cfg.write_tools)
+            # v0.2: use first_sink_call which covers write_tools + sink_tools + auto-detect
+            pending = first_sink_call(messages, self.cfg)
         if pending is None:
             return GuardResult(Decision.ALLOW, "no write call to guard",
                                source="no_write")
@@ -47,15 +50,28 @@ class Guard:
         ev = build_evidence(tc, prior, task, self.cfg)
 
         if hard_floor(ev):
+            reason = self._hard_floor_reason(ev)
             return GuardResult(
-                Decision.BLOCK,
-                "destination appears only in tool output and the tool is not in "
-                "the reference plan (injected-destination signature)",
+                Decision.BLOCK, reason,
                 evidence=ev, source="hard_floor", tool=tc.function, args=tc.args)
 
         if self.provider is not None:
             return self._llm_decide(messages, idx, tc, ev, task)
         return self._rules_decide(tc, ev)
+
+    def _hard_floor_reason(self, ev: Evidence) -> str:
+        """Build a human-readable reason for the hard floor trigger."""
+        if any(r.source == "user_forbidden" for r in ev.recipients):
+            forbidden = [r for r in ev.recipients if r.source == "user_forbidden"]
+            vals = ", ".join(r.value for r in forbidden)
+            return ("user explicitly prohibited destination(s): %s" % vals)
+        if ev.in_plan is False:
+            return ("destination appears only in tool output and the tool is not "
+                    "in the reference plan (injected-destination signature)")
+        if ev.in_plan is None and ev.external is True:
+            return ("destination appears only in tool output, no reference plan "
+                    "exists, and destination is external (high-confidence injection)")
+        return "hard floor triggered"
 
     def _llm_decide(self, messages, idx, tc, ev: Evidence, task) -> GuardResult:
         prompt = build_prompt(
@@ -67,7 +83,7 @@ class Guard:
             decision = Decision(fields["decision"])
             reason = fields.get("reason", "")
         except ParseError as e:
-            # Fail safe: unpar.seable model output => escalate, never silent allow.
+            # Fail safe: unparseable model output => escalate, never silent allow.
             return GuardResult(Decision.CONFIRM,
                                "LLM response could not be parsed (%s)" % e,
                                evidence=ev, source="llm", tool=tc.function,
@@ -79,6 +95,14 @@ class Guard:
 
     def _rules_decide(self, tc, ev: Evidence) -> GuardResult:
         prov = ev.provenance
+
+        # Forbidden is caught by hard_floor above, but belt-and-suspenders
+        if prov == "forbidden":
+            return GuardResult(Decision.BLOCK,
+                               "user explicitly prohibited this destination",
+                               evidence=ev, source="hard_floor", tool=tc.function,
+                               args=tc.args)
+
         if not ev.has_destination_param:
             # Deletes: source tracking cannot answer who asked -> escalate.
             return GuardResult(Decision.CONFIRM,
@@ -92,6 +116,15 @@ class Guard:
                                evidence=ev, source="rules", tool=tc.function,
                                args=tc.args)
         if prov == "tool":
+            # Tool-sourced destination — if we get here, hard_floor didn't trigger,
+            # meaning: plan exists and tool IS in plan, or no plan + internal domain.
+            # Either way, escalate to confirm (guided-not-static philosophy).
+            if ev.in_plan is None:
+                return GuardResult(Decision.CONFIRM,
+                                   "destination came from tool output and no "
+                                   "reference plan exists; escalating for review",
+                                   evidence=ev, source="rules", tool=tc.function,
+                                   args=tc.args)
             return GuardResult(Decision.BLOCK,
                                "destination came from a tool output, not the user",
                                evidence=ev, source="rules", tool=tc.function,

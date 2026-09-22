@@ -13,6 +13,14 @@ class Decision(str, Enum):
     UNDECIDABLE = "undecidable"
 
 
+class EntityKind(str, Enum):
+    """What kind of value a destination entity is."""
+    EMAIL = "email"
+    URL = "url"
+    PATH = "path"
+    GENERIC = "generic"
+
+
 @dataclass
 class ToolCall:
     function: str
@@ -31,17 +39,34 @@ class Message:
 
 @dataclass
 class RecipientSource:
+    """Where a destination value first appeared in the trace.
+
+    source values:
+        "user"           — found in a user message (positive / authorizing context)
+        "user_forbidden" — found in a user message inside a negation context
+        "tool"           — first appeared in a tool output
+        "absent"         — not found anywhere in prior messages
+    """
     value: str
-    source: str            # "user" | "tool" | "absent"
+    source: str            # "user" | "user_forbidden" | "tool" | "absent"
     source_tool: Optional[str] = None  # tool name when source == "tool"
+    entity_type: EntityKind = EntityKind.GENERIC
+    negation_context: Optional[str] = None  # the negation phrase when user_forbidden
 
     @property
     def text(self) -> str:
         if self.source == "user":
             return "user request"
+        if self.source == "user_forbidden":
+            ctx = (" (%s)" % self.negation_context) if self.negation_context else ""
+            return "user request (FORBIDDEN — user explicitly prohibited this destination%s)" % ctx
         if self.source == "tool":
             return "tool output (%s)" % (self.source_tool or "unknown")
         return "not found"
+
+
+# v0.2 alias — new name, old name kept for backward compatibility
+DestinationEntity = RecipientSource
 
 
 @dataclass
@@ -54,7 +79,8 @@ class Evidence:
     in_plan: Optional[bool] = None       # None => plan empty/unknown
     destructive: bool = False
     external: Optional[bool] = None       # any destination outside org domains
-    provenance: str = "unclear"           # "user" | "tool" | "unclear"
+    provenance: str = "unclear"           # "user" | "tool" | "forbidden" | "unclear"
+    source_to_sink_violation: bool = False  # v0.2: taint from untrusted source to sink
 
     def render(self) -> str:
         lines = ["Evidence collected by deterministic checks:"]
@@ -80,19 +106,26 @@ class Evidence:
         if self.external is not None:
             lines.append("- a destination is outside the organization's domains: %s"
                          % ("yes" if self.external else "no"))
+        if self.source_to_sink_violation:
+            lines.append("- SOURCE-TO-SINK VIOLATION: destination originated from "
+                         "untrusted tool output flowing to an external sink")
         return "\n".join(lines)
 
     def to_dict(self) -> dict:
         return {
             "tool": self.tool,
             "recipients": [{"value": r.value, "source": r.source,
-                            "source_tool": r.source_tool} for r in self.recipients],
+                            "source_tool": r.source_tool,
+                            "entity_type": r.entity_type.value,
+                            "negation_context": r.negation_context}
+                           for r in self.recipients],
             "has_destination_param": self.has_destination_param,
             "plan_tools": self.plan_tools,
             "in_plan": self.in_plan,
             "destructive": self.destructive,
             "external": self.external,
             "provenance": self.provenance,
+            "source_to_sink_violation": self.source_to_sink_violation,
         }
 
 
